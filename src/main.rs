@@ -1,11 +1,27 @@
-use hyper::{Body, Request, Response, Server, Method, StatusCode};
+use hyper::{
+    Body, Request, Response, Server, Method, StatusCode,
+    upgrade::Upgraded,
+    header::{CONNECTION, UPGRADE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_ACCEPT}
+};
 use hyper::service::{make_service_fn, service_fn};
 use std::convert::Infallible;
-use tokio::sync::Mutex;
 use std::sync::Arc;
-use std::env;
+use tokio::sync::Mutex;
 use serde::{Serialize, Deserialize};
 use serde_json::json;
+use sha1::{Sha1, Digest};
+use base64::engine::general_purpose;
+use base64::Engine;
+use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
+use futures_util::{StreamExt, SinkExt};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Measurement {
+    timestamp: u64,
+    ping_ms: f64,
+}
+
+type Store = Arc<Mutex<Vec<Measurement>>>;
 
 fn add_cors_headers(res: &mut Response<Body>) {
     let headers = res.headers_mut();
@@ -14,14 +30,35 @@ fn add_cors_headers(res: &mut Response<Body>) {
     headers.insert("Access-Control-Allow-Headers", "Content-Type".parse().unwrap());
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Measurement {
-    timestamp: u64, // es. epoch ms dal client
-    ping_ms: f64,
-    // eventualmente aggiungi jitter, packet_loss, ecc.
-}
+async fn handle_ws_connection(upgraded: Upgraded) {
+    let ws_stream = WebSocketStream::from_raw_socket(
+        upgraded,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None
+    ).await;
 
-type Store = Arc<Mutex<Vec<Measurement>>>;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                println!("Ricevuto testo: {}", text);
+                if let Err(e) = ws_sender.send(Message::Text(text)).await {
+                    eprintln!("Errore invio WS: {}", e);
+                    break;
+                }
+            }
+            Ok(Message::Binary(bin)) => {
+                println!("Ricevuti dati binari di {} byte", bin.len());
+            }
+            Ok(Message::Close(_)) => {
+                println!("Connessione WS chiusa dal client");
+                break;
+            }
+            _ => {}
+        }
+    }
+}
 
 async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infallible> {
     if req.method() == Method::OPTIONS {
@@ -30,11 +67,42 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
         return Ok(response);
     }
 
+    if req.uri().path() == "/ws" && req.headers().get(UPGRADE).map(|v| v == "websocket").unwrap_or(false) {
+        if let Some(ws_key) = req.headers().get(SEC_WEBSOCKET_KEY) {
+            let mut hasher = Sha1::new();
+            hasher.update(ws_key.as_bytes());
+            hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let result = hasher.finalize();
+            let accept_key = general_purpose::STANDARD.encode(result);
+
+            let response = Response::builder()
+                .status(StatusCode::SWITCHING_PROTOCOLS)
+                .header(CONNECTION, "Upgrade")
+                .header(UPGRADE, "websocket")
+                .header(SEC_WEBSOCKET_ACCEPT, accept_key)
+                .body(Body::empty())
+                .unwrap();
+
+            tokio::spawn(async move {
+                if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                    handle_ws_connection(upgraded).await;
+                } else {
+                    eprintln!("Errore nell'upgrade WebSocket");
+                }
+            });
+
+            return Ok(response);
+        } else {
+            let mut response = Response::new(Body::from("Bad Request"));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            return Ok(response);
+        }
+    }
+
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/measure") => {
-            // Riceve una singola misurazione in JSON e la salva
-            let whole_body = hyper::body::to_bytes(req.into_body()).await.unwrap();
-            match serde_json::from_slice::<Measurement>(&whole_body) {
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+            match serde_json::from_slice::<Measurement>(&body) {
                 Ok(measure) => {
                     let mut data = store.lock().await;
                     data.push(measure);
@@ -51,7 +119,6 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
             }
         }
         (&Method::GET, "/measures") => {
-            // Restituisce tutte le misurazioni in JSON
             let data = store.lock().await;
             let json_data = json!(*data);
             let body = Body::from(serde_json::to_string(&json_data).unwrap());
@@ -61,7 +128,6 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
             Ok(response)
         }
         (&Method::GET, "/download") => {
-            // come prima, simulazione download
             let chunk_size = 1024 * 1024;
             let chunks_count = 100;
 
@@ -82,15 +148,14 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
             Ok(response)
         }
         (&Method::POST, "/upload") => {
-            let whole_body = hyper::body::to_bytes(req.into_body()).await.unwrap();
-            let size = whole_body.len();
-            println!("Ricevuti {} byte", size);
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+            println!("Ricevuti {} byte", body.len());
             let mut response = Response::new(Body::from("OK"));
             add_cors_headers(&mut response);
             Ok(response)
         }
         _ => {
-            let mut not_found = Response::default();
+            let mut not_found = Response::new(Body::from("Not found"));
             *not_found.status_mut() = StatusCode::NOT_FOUND;
             add_cors_headers(&mut not_found);
             Ok(not_found)
@@ -102,12 +167,7 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
 async fn main() {
     let store: Store = Arc::new(Mutex::new(Vec::new()));
 
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse()
-        .expect("PORT must be a number");
-    let addr = ([0, 0, 0, 0], port).into();
-
+    let addr = ([0, 0, 0, 0], 3000).into();
     let make_svc = make_service_fn(move |_conn| {
         let store = store.clone();
         async move {
