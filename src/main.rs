@@ -187,7 +187,13 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
 async fn main() {
     let store: Store = Arc::new(Mutex::new(Vec::new()));
 
-    let addr = ([0, 0, 0, 0], 3000).into();
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+
+    let addr = ([0, 0, 0, 0], port).into();
+
     let make_svc = make_service_fn(move |_conn| {
         let store = store.clone();
         async move {
