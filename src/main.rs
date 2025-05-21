@@ -14,6 +14,8 @@ use base64::engine::general_purpose;
 use base64::Engine;
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
+use serde_json::Value;
+
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Measurement {
@@ -42,7 +44,25 @@ async fn handle_ws_connection(upgraded: Upgraded) {
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                println!("Ricevuto testo: {}", text);
+
+                if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                    if data.get("type") == Some(&Value::String("ping".into())) {
+                        if let Some(seq) = data.get("seq") {
+                            let pong_msg = json!({
+                                "type": "pong",
+                                "seq": seq
+                            });
+
+                            let pong_text = pong_msg.to_string();
+                            if let Err(e) = ws_sender.send(Message::Text(pong_text)).await {
+                                eprintln!("Errore invio pong WS: {}", e);
+                                break;
+                            }
+                            continue; // saltare l'echo normale
+                        }
+                    }
+                }
+
                 if let Err(e) = ws_sender.send(Message::Text(text)).await {
                     eprintln!("Errore invio WS: {}", e);
                     break;
@@ -178,6 +198,5 @@ async fn main() {
     });
 
     let server = Server::bind(&addr).serve(make_svc);
-    println!("Server in ascolto su http://{}", addr);
     server.await.unwrap();
 }
