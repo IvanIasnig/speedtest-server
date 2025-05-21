@@ -48,7 +48,6 @@ async fn router(req: Request<Body>) -> Result<Response<Body>, Infallible> {
             Ok(response)
         }
         (&Method::OPTIONS, _) => {
-            // Rispondi alle richieste OPTIONS per CORS preflight
             let mut response = Response::new(Body::empty());
             response.headers_mut().insert(
                 ACCESS_CONTROL_ALLOW_ORIGIN,
