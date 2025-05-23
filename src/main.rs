@@ -103,6 +103,7 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
                 .body(Body::empty())
                 .unwrap();
 
+                
             tokio::spawn(async move {
                 if let Ok(upgraded) = hyper::upgrade::on(req).await {
                     handle_ws_connection(upgraded).await;
@@ -157,7 +158,6 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
                     None
                 } else {
                     let chunk = vec![0u8; chunk_size];
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     Some((Ok::<Vec<u8>, Infallible>(chunk), count + 1))
                 }
             });
