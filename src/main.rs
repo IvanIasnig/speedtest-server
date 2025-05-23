@@ -15,6 +15,7 @@ use base64::Engine;
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde_json::Value;
+use std::time::Instant;
 
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -167,13 +168,36 @@ async fn router(req: Request<Body>, store: Store) -> Result<Response<Body>, Infa
             add_cors_headers(&mut response);
             Ok(response)
         }
+
+
         (&Method::POST, "/upload") => {
-            let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
-            println!("Ricevuti {} byte", body.len());
+            let mut body = req.into_body();
+            let mut total_bytes = 0usize;
+
+            let start = Instant::now();
+
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.unwrap();
+                total_bytes += chunk.len();
+            }
+
+            let duration = start.elapsed().as_secs_f64(); // in secondi
+
+            let mbits = (total_bytes as f64 * 8.0) / 1_000_000.0;
+            let mbps = mbits / duration;
+
+            println!(
+                "Ricevuti {} byte in {:.2} secondi → {:.2} Mbps",
+                total_bytes,
+                duration,
+                mbps
+            );
+
             let mut response = Response::new(Body::from("OK"));
             add_cors_headers(&mut response);
             Ok(response)
         }
+
         _ => {
             let mut not_found = Response::new(Body::from("Not found"));
             *not_found.status_mut() = StatusCode::NOT_FOUND;
